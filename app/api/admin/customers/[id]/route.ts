@@ -19,6 +19,9 @@ type RouteContext = {
   };
 };
 
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 export async function GET(_req: NextRequest, { params }: RouteContext) {
   try {
     await connectDB();
@@ -28,7 +31,7 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
     if (!customer) {
       return NextResponse.json(
         { success: false, message: "Customer not found" },
-        { status: 404 }
+        { status: 404, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -52,25 +55,28 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
       0
     );
 
-    return NextResponse.json({
-      success: true,
-      customer,
-      wallet,
-      animals,
-      transactions,
-      milkHistory,
-      statistics: {
-        totalMilk,
-        totalEarnings,
-        totalTransactions: transactions.length,
-        totalAnimals: animals.length,
+    return NextResponse.json(
+      {
+        success: true,
+        customer,
+        wallet,
+        animals,
+        transactions,
+        milkHistory,
+        statistics: {
+          totalMilk,
+          totalEarnings,
+          totalTransactions: transactions.length,
+          totalAnimals: animals.length,
+        },
       },
-    });
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     console.error("Admin Customer Details Error:", error);
     return NextResponse.json(
       { success: false, message: "Server Error" },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
@@ -81,7 +87,7 @@ export async function DELETE(req: NextRequest, { params }: RouteContext) {
   if (!token) {
     return NextResponse.json(
       { success: false, message: "Unauthorized" },
-      { status: 401 }
+      { status: 401, headers: { "Cache-Control": "no-store" } }
     );
   }
 
@@ -91,28 +97,31 @@ export async function DELETE(req: NextRequest, { params }: RouteContext) {
     if (payload.role !== "admin") {
       return NextResponse.json(
         { success: false, message: "Admin access required" },
-        { status: 403 }
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       );
     }
 
     if (!mongoose.isValidObjectId(params.id)) {
       return NextResponse.json(
         { success: false, message: "Invalid customer ID" },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
     await connectDB();
 
-    const customer = await User.findOne({
-      _id: params.id,
-      role: "user",
+    const customerId = new mongoose.Types.ObjectId(params.id);
+
+    // Never allow this customer endpoint to remove an administrator.
+    const adminAccount = await User.findOne({
+      _id: customerId,
+      role: "admin",
     }).select("_id");
 
-    if (!customer) {
+    if (adminAccount) {
       return NextResponse.json(
-        { success: false, message: "Customer not found" },
-        { status: 404 }
+        { success: false, message: "Admin accounts cannot be deleted here" },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -120,10 +129,8 @@ export async function DELETE(req: NextRequest, { params }: RouteContext) {
 
     try {
       await session.withTransaction(async () => {
-        // Find dairy transactions involving this customer so their linked
-        // payment records can be removed in the same database transaction.
         const dairyTransactions = await Transaction.find({
-          $or: [{ seller: customer._id }, { buyer: customer._id }],
+          $or: [{ seller: customerId }, { buyer: customerId }],
         })
           .select("_id")
           .session(session);
@@ -135,8 +142,8 @@ export async function DELETE(req: NextRequest, { params }: RouteContext) {
         await Payment.deleteMany(
           {
             $or: [
-              { paidBy: customer._id },
-              { paidTo: customer._id },
+              { paidBy: customerId },
+              { paidTo: customerId },
               { transaction: { $in: dairyTransactionIds } },
             ],
           },
@@ -145,45 +152,44 @@ export async function DELETE(req: NextRequest, { params }: RouteContext) {
 
         await Transaction.deleteMany(
           {
-            $or: [{ seller: customer._id }, { buyer: customer._id }],
+            $or: [{ seller: customerId }, { buyer: customerId }],
           },
           { session }
         );
-        await MilkRecords.deleteMany({ customerId: customer._id }, { session });
-        await WalletTransaction.deleteMany(
-          { customerId: customer._id },
-          { session }
-        );
-        await Withdrawal.deleteMany({ customerId: customer._id }, { session });
-        await Notification.deleteMany(
-          { customerId: customer._id },
-          { session }
-        );
-        await Animal.deleteMany({ owner: customer._id }, { session });
-        await Wallet.deleteOne({ customerId: customer._id }, { session });
 
-        const deletedCustomer = await User.deleteOne(
-          { _id: customer._id, role: "user" },
+        await MilkRecords.deleteMany({ customerId }, { session });
+        await WalletTransaction.deleteMany({ customerId }, { session });
+        await Withdrawal.deleteMany({ customerId }, { session });
+        await Notification.deleteMany({ customerId }, { session });
+        await Animal.deleteMany({ owner: customerId }, { session });
+        await Wallet.deleteOne({ customerId }, { session });
+
+        // Also removes any orphaned customer data if the User document
+        // was already removed. This makes retries safe and repeatable.
+        await User.deleteOne(
+          { _id: customerId, role: "user" },
           { session }
         );
-
-        if (deletedCustomer.deletedCount !== 1) {
-          throw new Error("Customer deletion did not complete");
-        }
       });
     } finally {
       await session.endSession();
     }
 
-    return NextResponse.json({
-      success: true,
-      message: "Customer and related records deleted successfully",
-    });
+    return NextResponse.json(
+      {
+        success: true,
+        message: "Customer and related records deleted successfully",
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     console.error("Admin Customer Deletion Error:", error);
     return NextResponse.json(
-      { success: false, message: "Customer deletion failed. No changes were saved." },
-      { status: 500 }
+      {
+        success: false,
+        message: "Customer deletion failed. No changes were saved.",
+      },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
